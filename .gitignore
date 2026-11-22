@@ -1,0 +1,7 @@
+.DS_Store
+*.log
+__pycache__/
+签名*.png
+签名*.svg
+signature*.png
+signature*.svg

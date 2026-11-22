@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>触摸板签名板 · 绝对坐标模式</title>
+<style>
+  :root{ --ink:#1b1b1b; --accent:#0a7d5c; --line:#d8d4c8; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
+       background:#f2f0eb;color:var(--ink);min-height:100vh;display:flex;flex-direction:column;
+       align-items:center;padding:24px 16px;user-select:none;-webkit-user-select:none}
+  h1{font-size:18px;font-weight:600}
+  .sub{font-size:12px;color:#7a766d;margin:4px 0 14px}
+  .toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center;margin-bottom:12px;max-width:960px}
+  .btn{appearance:none;border:1px solid #c9c4b8;background:#fff;border-radius:8px;padding:7px 13px;
+       font-size:13px;cursor:pointer;color:var(--ink)}
+  .btn:hover{border-color:#8f8a7e}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.stop{background:#b0401f;border-color:#b0401f;color:#fff}
+  .btn.stop:hover{border-color:#8a3016}
+  .group{display:flex;align-items:center;gap:6px;background:#fff;border:1px solid #ddd;border-radius:8px;
+         padding:6px 10px;font-size:13px;color:#444}
+  input[type=range]{width:100px}
+  .chip{font-size:12px;border-radius:999px;padding:3px 10px;border:1px solid var(--line);background:#fff;color:#666}
+  .chip.inking{background:#fdeeea;border-color:#e0a090;color:#b0401f}
+  .chip.ok{background:#e8f4ee;border-color:#9fc9b4;color:#0a7d5c}
+  .canvas-wrap{position:relative;background:#fffdf7;border:1px solid var(--line);
+       border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.06);overflow:hidden;transition:border-color .15s}
+  .canvas-wrap.live{border-color:#9fc9b4}
+  .canvas-wrap.armed{border-color:var(--accent);box-shadow:0 0 0 2px rgba(10,125,92,.18)}
+  .chip.press-hot{background:#fdeeea;border-color:#e0a090;color:#b0401f}
+  canvas{position:absolute;inset:0;display:block}
+  .hint{margin-top:12px;font-size:12px;color:#6d6961;max-width:960px;line-height:1.8}
+  .kbd{background:#e9e6df;border-radius:4px;padding:0 5px;font-size:11px}
+</style>
+</head>
+<body>
+<h1>触摸板签名板 · 绝对坐标</h1>
+<p class="sub">触摸板板面 = 整块画布：手指落在哪，笔就落在哪；触碰即落笔、抬起即收笔</p>
+
+<div class="toolbar">
+  <span class="chip" id="connState">连接守护进程中…</span>
+  <span class="chip" id="pressure">压力 —</span>
+  <button class="btn" id="toggleBtn">开始书写（空格）</button>
+  <label class="group">笔粗 <input id="width" type="range" min="2" max="9" step="0.5" value="4.5">
+    <span id="widthVal">4.5</span></label>
+  <label class="group" id="firmGroup" title="备用模式（无点按权限时生效）：接触面积达到此值视为重按">
+    起笔阈值 <input id="firm" type="range" min="0.6" max="4" step="0.1" value="1.4">
+    <span id="firmVal">1.4</span></label>
+  <label class="group">颜色
+    <select id="color">
+      <option value="#1b1b1b">黑（打印推荐）</option>
+      <option value="#1c3f94">蓝（钢笔）</option>
+    </select>
+  </label>
+  <button class="btn" id="undo">撤销</button>
+  <button class="btn" id="clear">清空</button>
+  <button class="btn primary" id="dlPng">下载 透明PNG</button>
+  <button class="btn" id="dlWhite">下载 白底PNG</button>
+  <button class="btn" id="dlSvg">下载 SVG</button>
+</div>
+
+<div class="canvas-wrap" id="wrap"><canvas id="pad"></canvas></div>
+
+<p class="hint">
+  · <b>按空格键 = 开始书写</b>（或点「开始书写」按钮，状态灯变绿），之后手指落在板面哪里笔就落在哪里，触碰即落笔、抬起即收笔；<b>再按空格 = 结束</b>，轻滑误触不再落墨。<br>
+  · 触摸板点按开关也在后台监听（若系统放行事件，点按一下同样能切换；日志会打印「收到系统点按事件」）；被权限拦截时就用空格，效果完全一样。<br>
+  · 开关只在签名页面处于前台时生效（键盘事件本来就只发给前台页面）。<br>
+  · 按得重笔画粗、轻则细，快写细慢写粗；导出自动裁剪 + 约 3 倍，透明 PNG 直接盖在文档签名线上。快捷键 <span class="kbd">空格</span> 开关 · <span class="kbd">⌘Z</span> 撤销 · <span class="kbd">⌘S</span> 下载透明 PNG。<br>
+  · 签名属敏感资料：下载后放本地目录（本工具所在文件夹即可），勿上传云端。
+</p>
+
+<script>
+(function(){
+  'use strict';
+  var pad=document.getElementById('pad'), wrap=document.getElementById('wrap');
+  var ctx=pad.getContext('2d');
+  var widthEl=document.getElementById('width'), widthValEl=document.getElementById('widthVal');
+  var colorEl=document.getElementById('color');
+  var connChip=document.getElementById('connState');
+
+  var strokes=[];            // [{color, pts:[{x,y,w,t}]}]
+  var cur=null, curSize=0.55;
+  var sx=0, sy=0, sw=4, hasSmoothed=false;
+  var statusTimer=null;
+  var aspectW=121.9, aspectH=74.1;
+
+  function cssW(){return wrap.clientWidth}
+  function cssH(){return wrap.clientHeight}
+  function base(){return parseFloat(widthEl.value)}
+
+  function setStatus(msg,cls){
+    connChip.textContent=msg;
+    connChip.classList.remove('inking','ok');
+    if(cls)connChip.classList.add(cls);
+  }
+  function flash(msg,cls){
+    setStatus(msg,cls);
+    clearTimeout(statusTimer);
+    statusTimer=setTimeout(function(){setStatus('已连接 · 板面即画布','ok')},1600);
+  }
+
+  function resize(){
+    var dpr=window.devicePixelRatio||1;
+    pad.width=Math.round(cssW()*dpr);
+    pad.height=Math.round(cssH()*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    redraw();
+  }
+  function layout(){
+    var ar=aspectW/aspectH;
+    var maxW=Math.min(960,window.innerWidth-40);
+    var maxH=Math.min(560,window.innerHeight-230);
+    var w=maxW,h=w/ar;
+    if(h>maxH){h=maxH;w=h*ar}
+    wrap.style.width=Math.round(w)+'px';
+    wrap.style.height=Math.round(h)+'px';
+    resize();
+  }
+  function setAspect(aw,ah){aspectW=aw||121.9;aspectH=ah||74.1;layout()}
+
+  function drawGuides(){
+    var w=cssW(),h=cssH();
+    ctx.save();
+    ctx.strokeStyle='rgba(0,0,0,.13)';
+    ctx.lineWidth=1;
+    ctx.setLineDash([7,7]);
+    ctx.beginPath();ctx.moveTo(w*.06,h*.74);ctx.lineTo(w*.94,h*.74);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(0,0,0,.25)';
+    ctx.font='12px -apple-system,"PingFang SC",sans-serif';
+    ctx.fillText('签名基线（仅供参考，不会出现在导出文件里）',w*.06,h*.74+20);
+    ctx.restore();
+  }
+
+  function seg(s,i){
+    var a=s.pts[i],b=s.pts[i+1];
+    ctx.strokeStyle=s.color;
+    ctx.lineCap='round';ctx.lineJoin='round';
+    ctx.lineWidth=Math.max(.4,(a.w+b.w)/2);
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+  }
+  function dot(s){
+    var p=s.pts[0];
+    ctx.fillStyle=s.color;
+    ctx.beginPath();ctx.arc(p.x,p.y,Math.max(.4,p.w/2),0,6.2832);ctx.fill();
+  }
+  function drawStroke(s){
+    if(s.pts.length===1){dot(s);return}
+    for(var i=0;i<s.pts.length-1;i++)seg(s,i);
+  }
+  function redraw(){
+    ctx.clearRect(0,0,cssW(),cssH());
+    drawGuides();
+    for(var i=0;i<strokes.length;i++)drawStroke(strokes[i]);
+    if(cur)drawStroke(cur);
+  }
+
+  function beginStroke(x,y){
+    cur={color:colorEl.value,pts:[]};
+    sx=x;sy=y;sw=base()*1.15;hasSmoothed=false;
+    addPoint(x,y);
+  }
+  function addPoint(x,y){
+    if(!cur)return;
+    if(!hasSmoothed){sx=x;sy=y;hasSmoothed=true}
+    else{sx+=(x-sx)*.42;sy+=(y-sy)*.42}
+    var pts=cur.pts,t=performance.now();
+    if(pts.length){
+      var p=pts[pts.length-1];
+      var dt=Math.max(4,t-p.t);
+      var v=Math.hypot(sx-p.x,sy-p.y)/dt;              // px per ms
+      var velF=Math.min(1.45,Math.max(.38,1.45-.5*v)); // 快细慢粗
+      var szF=.78+.5*Math.min(1,Math.max(0,(curSize-.2)/1.2)); // 重按更粗
+      var target=base()*velF*szF;
+      sw+=(target-sw)*.25;
+    }
+    cur.pts.push({x:sx,y:sy,w:sw,t:t});
+    if(cur.pts.length>=2)seg(cur,cur.pts.length-2);else dot(cur);
+  }
+  function endStroke(){
+    if(cur&&cur.pts.length)strokes.push(cur);
+    cur=null;hasSmoothed=false;
+  }
+
+  // ---------- SSE ----------
+
+  var firmHigh=1.4, armedOn=false, modeNow='pressure';
+  var pressChip=document.getElementById('pressure');
+  var firmEl=document.getElementById('firm'), firmValEl=document.getElementById('firmVal');
+  var firmGroup=document.getElementById('firmGroup');
+  var toggleBtn=document.getElementById('toggleBtn');
+
+  function doToggle(){
+    fetch('/toggle',{method:'POST'}).then(function(r){return r.json()})
+      .then(function(d){armedOn=!!d.armed;renderState()})
+      .catch(function(){});
+  }
+  toggleBtn.addEventListener('click',doToggle);
+
+  function renderState(){
+    if(armedOn){
+      setStatus('书写中 · 再按空格结束','ok');
+      wrap.classList.add('armed');
+      toggleBtn.textContent='结束书写（空格）';
+      toggleBtn.classList.add('stop');
+    }else{
+      wrap.classList.remove('armed');
+      toggleBtn.textContent='开始书写（空格）';
+      toggleBtn.classList.remove('stop');
+      if(modeNow==='click')setStatus('已连接 · 待命（空格或点按触摸板开始）',null);
+      else setStatus('已连接 · 待命（按空格开始）',null);
+    }
+  }
+  function applyMode(m){
+    modeNow=m||'pressure';
+    firmGroup.style.display=(modeNow==='click')?'none':'';
+    renderState();
+  }
+  function setFirmUI(v){
+    firmHigh=v;
+    firmEl.value=v;firmValEl.textContent=v.toFixed(1);
+  }
+
+  function onPen(d){
+    var px=d.x*cssW(), py=(1-d.y)*cssH();   // y 归一化向上 → 画布向下
+    if(typeof d.s==='number')curSize=d.s;
+    if(d.t==='down'){wrap.classList.add('live');beginStroke(px,py)}
+    else if(d.t==='move')addPoint(px,py);
+    else if(d.t==='up'){endStroke();wrap.classList.remove('live')}
+  }
+  var es=new EventSource('/events');
+  es.addEventListener('hello',function(e){
+    var d={};
+    try{d=JSON.parse(e.data)}catch(_){}
+    setAspect(d.aspect_w,d.aspect_h);
+    if(typeof d.firm==='number')setFirmUI(d.firm);
+    if(typeof d.armed==='boolean'){armedOn=d.armed}
+    applyMode(d.mode);
+  });
+  es.addEventListener('mode',function(e){
+    try{applyMode((JSON.parse(e.data)||{}).mode)}catch(_){}
+  });
+  es.addEventListener('pen',function(e){
+    try{onPen(JSON.parse(e.data))}catch(_){}
+  });
+  es.addEventListener('armed',function(e){
+    try{armedOn=!!(JSON.parse(e.data)||{}).on;renderState()}catch(_){}
+  });
+  es.addEventListener('firm',function(e){
+    try{setFirmUI((JSON.parse(e.data)||{}).firm)}catch(_){}
+  });
+  es.addEventListener('touch',function(e){
+    var d=null;
+    try{d=JSON.parse(e.data)}catch(_){}
+    if(d&&typeof d.s==='number'){
+      pressChip.textContent='压力 '+d.s.toFixed(2)+(modeNow==='click'?'':' / 阈值 '+firmHigh.toFixed(1));
+      pressChip.classList.toggle('press-hot',modeNow!=='click'&&d.s>=firmHigh);
+    }else{
+      pressChip.textContent='压力 —';
+      pressChip.classList.remove('press-hot');
+    }
+  });
+  es.onerror=function(){setStatus('未连接守护进程（trackpad_sign.py）','inking')};
+
+  firmEl.addEventListener('input',function(){
+    var v=parseFloat(firmEl.value);
+    firmValEl.textContent=v.toFixed(1);
+    fetch('/firm',{method:'POST',headers:{'Content-Type':'application/json'},
+                   body:JSON.stringify({v:v})}).catch(function(){});
+  });
+
+  // 页面聚焦心跳：重按开关只在签名页前台时生效
+  function ping(){ if(document.hasFocus()&&!document.hidden){ try{fetch('/ping').catch(function(){})}catch(_){}} }
+  setInterval(ping,800);
+  window.addEventListener('focus',ping);
+  document.addEventListener('visibilitychange',ping);
+  ping();
+
+  // ---------- 工具栏 ----------
+
+  function undo(){ if(cur){cur=null;hasSmoothed=false} else strokes.pop(); redraw(); }
+  function clearAll(){ strokes=[];cur=null;hasSmoothed=false;redraw(); }
+
+  document.getElementById('undo').addEventListener('click',undo);
+  document.getElementById('clear').addEventListener('click',clearAll);
+  widthEl.addEventListener('input',function(){widthValEl.textContent=widthEl.value});
+
+  // ---------- 导出（自动裁剪 + 3x） ----------
+
+  function bbox(){
+    var m={minX:1e9,minY:1e9,maxX:-1e9,maxY:-1e9};
+    function eat(p){
+      if(p.x-p.w<m.minX)m.minX=p.x-p.w; if(p.x+p.w>m.maxX)m.maxX=p.x+p.w;
+      if(p.y-p.w<m.minY)m.minY=p.y-p.w; if(p.y+p.w>m.maxY)m.maxY=p.y+p.w;
+    }
+    for(var i=0;i<strokes.length;i++)for(var j=0;j<strokes[i].pts.length;j++)eat(strokes[i].pts[j]);
+    return m;
+  }
+  var PADPX=16;
+  function dims(){
+    var b=bbox();
+    return {b:b,w:(b.maxX-b.minX)+PADPX*2,h:(b.maxY-b.minY)+PADPX*2};
+  }
+  function renderTo(c,scale,bg){
+    var d=dims();
+    c.width=Math.max(1,Math.round(d.w*scale));
+    c.height=Math.max(1,Math.round(d.h*scale));
+    var g=c.getContext('2d');
+    if(bg){g.fillStyle=bg;g.fillRect(0,0,c.width,c.height)}
+    g.setTransform(scale,0,0,scale,(PADPX-d.b.minX)*scale,(PADPX-d.b.minY)*scale);
+    g.lineCap='round';g.lineJoin='round';
+    for(var i=0;i<strokes.length;i++){
+      var s=strokes[i];
+      if(s.pts.length===1){var p=s.pts[0];g.fillStyle=s.color;g.beginPath();
+        g.arc(p.x,p.y,Math.max(.4,p.w/2),0,6.2832);g.fill();continue}
+      for(var j=0;j<s.pts.length-1;j++){
+        var a=s.pts[j],q=s.pts[j+1];
+        g.strokeStyle=s.color;
+        g.lineWidth=Math.max(.4,(a.w+q.w)/2);
+        g.beginPath();g.moveTo(a.x,a.y);g.lineTo(q.x,q.y);g.stroke();
+      }
+    }
+    return d;
+  }
+  function rr(v){return Math.round(v*100)/100}
+  function svgText(){
+    var d=dims(),out=[];
+    for(var i=0;i<strokes.length;i++){
+      var s=strokes[i];
+      out.push('<g stroke="'+s.color+'" fill="none" stroke-linecap="round" stroke-linejoin="round">');
+      if(s.pts.length===1){
+        var p=s.pts[0];
+        out.push('<circle cx="'+rr(p.x+PADPX-d.b.minX)+'" cy="'+rr(p.y+PADPX-d.b.minY)+'" r="'+rr(Math.max(.4,p.w/2))+'" fill="'+s.color+'" stroke="none"/>');
+      }else for(var j=0;j<s.pts.length-1;j++){
+        var a=s.pts[j],q=s.pts[j+1];
+        out.push('<line x1="'+rr(a.x+PADPX-d.b.minX)+'" y1="'+rr(a.y+PADPX-d.b.minY)+'" x2="'+rr(q.x+PADPX-d.b.minX)+'" y2="'+rr(q.y+PADPX-d.b.minY)+'" stroke-width="'+rr(Math.max(.4,(a.w+q.w)/2))+'"/>');
+      }
+      out.push('</g>');
+    }
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+rr(d.w)+' '+rr(d.h)+'" width="'+rr(d.w)+'" height="'+rr(d.h)+'">\n'+out.join('\n')+'\n</svg>';
+  }
+  function stamp(){
+    var d=new Date(),z=function(n){return (n<10?'0':'')+n};
+    return d.getFullYear()+z(d.getMonth()+1)+z(d.getDate())+'_'+z(d.getHours())+z(d.getMinutes())+z(d.getSeconds());
+  }
+  function dl(blob,name){
+    var a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);a.download=name;
+    document.body.appendChild(a);a.click();a.remove();
+    setTimeout(function(){URL.revokeObjectURL(a.href)},2000);
+  }
+  function guard(){
+    if(!strokes.length){flash('还没有签名内容','inking');return false}
+    return true;
+  }
+  function dlPng(){
+    if(!guard())return;
+    var c=document.createElement('canvas');
+    renderTo(c,3,null);
+    c.toBlob(function(b){dl(b,'签名_'+stamp()+'.png');flash('已导出透明 PNG','ok')},'image/png');
+  }
+  function dlWhite(){
+    if(!guard())return;
+    var c=document.createElement('canvas');
+    renderTo(c,3,'#ffffff');
+    c.toBlob(function(b){dl(b,'签名_白底_'+stamp()+'.png');flash('已导出白底 PNG','ok')},'image/png');
+  }
+  function dlSvg(){
+    if(!guard())return;
+    dl(new Blob([svgText()],{type:'image/svg+xml'}),'签名_'+stamp()+'.svg');
+    flash('已导出 SVG','ok');
+  }
+  document.getElementById('dlPng').addEventListener('click',dlPng);
+  document.getElementById('dlWhite').addEventListener('click',dlWhite);
+  document.getElementById('dlSvg').addEventListener('click',dlSvg);
+
+  window.addEventListener('keydown',function(e){
+    var k=(e.key||'').toLowerCase();
+    if(e.code==='Space'&&!e.metaKey&&!e.ctrlKey&&!e.altKey&&!e.repeat){
+      e.preventDefault();
+      doToggle();
+      return;
+    }
+    if((e.metaKey||e.ctrlKey)&&k==='z'){e.preventDefault();undo()}
+    else if((e.metaKey||e.ctrlKey)&&k==='s'){e.preventDefault();dlPng()}
+  });
+  window.addEventListener('resize',layout);
+
+  // 自检钩子（不影响正常使用）
+  window.__padTest={
+    strokeCount:function(){return strokes.length},
+    exportDims:function(){var c=document.createElement('canvas');renderTo(c,3,null);return {w:c.width,h:c.height}},
+    svgHead:function(){return svgText().slice(0,160)},
+    connState:function(){return connChip.textContent},
+    armed:function(){return armedOn},
+    mode:function(){return modeNow},
+    toggleBtnLabel:function(){return toggleBtn.textContent},
+    pressure:function(){return pressChip.textContent},
+    setFirm:function(v){return fetch('/firm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({v:v})}).then(function(r){return r.json()})},
+    selftest:function(){return fetch('/selftest').then(function(r){return r.text()})}
+  };
+
+  layout();
+})();
+</script>
+</body>
+</html>
